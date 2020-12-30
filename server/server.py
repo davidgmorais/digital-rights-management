@@ -222,22 +222,6 @@ class MediaServer(resource.Resource):
         digest.update(message)
         return digest.finalize()
 
-    def do_get_protocols(self, request):
-        """
-        Processes the GET request to the protocols endpoint
-
-        @oaram: request The request tht came from the client in bytes
-        @return The response, in bytes, to the client
-        """
-
-        request.setResponseCode(200)
-        request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-        message = {
-            'type': 'PROTOOCOLS',
-            'data': {'negotiate': 'NEGOTIATE', 'dh_init': 'DH_INIT'}
-        }
-        return self.send(message)
-
     def do_post_protocols(self, request):
         """
         Processes a POST request to the protocols endpoint based on the type of message
@@ -245,8 +229,6 @@ class MediaServer(resource.Resource):
         @oaram: request The request that came from the client in bytes
         @return The encrypted response sent to the client
         """
-
-        # TODO: authenticate the request
 
         if (request.args.get(b'type')):
             msg_type = request.args.get(b'type')[0]
@@ -344,7 +326,6 @@ class MediaServer(resource.Resource):
         if msg_type == b'DH_INIT':
             p = int(request.args.get(b'p')[0].decode())
             g = int(request.args.get(b'g')[0].decode())
-
             self.parameters = dh.DHParameterNumbers(p, g).parameters(default_backend())
 
             # generate a secret key
@@ -362,10 +343,8 @@ class MediaServer(resource.Resource):
             return self.send(message)
 
         elif msg_type == b'KEY_EXCHANGE':
-
             client_public_key = load_pem_public_key(request.args.get(b'public_key')[0], backend=default_backend())
             shared_secret = self.private_key.exchange(client_public_key)
-
             logger.debug(f'Got shared secret: {shared_secret}')
 
             if self.digest == 'SHA-256':
@@ -390,7 +369,6 @@ class MediaServer(resource.Resource):
                 'type': 'OK',
                 'data': {}
             }
-
             return self.send(message)
 
     def do_regen_key(self, request):
@@ -462,7 +440,6 @@ class MediaServer(resource.Resource):
         logger.debug(f'Received data: {data}')
 
         if USERS.get(username):
-
             if USERS.get(username).get('password') == data:
                 
                 # generating token
@@ -491,7 +468,6 @@ class MediaServer(resource.Resource):
                     'data': binascii.b2a_base64(token).decode()
                 }
                 return self.send(message)
-
             else:
                 logger.debug('Authentication failed - wrong password')
                 message = {
@@ -650,10 +626,7 @@ class MediaServer(resource.Resource):
         logger.debug(f'Received request for {request.uri}')
         
         try:
-            if request.path == b'/api/protocols':
-                return self.do_get_protocols(request)
-
-            elif request.path == b'/api/list':
+            if request.path == b'/api/list':
                 return self.do_list(request)
 
             elif request.path == b'/api/download':
