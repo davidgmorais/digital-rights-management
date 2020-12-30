@@ -7,6 +7,8 @@ import os
 import subprocess
 import time
 import sys
+import getpass
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.serialization import Encoding, ParameterFormat, PublicFormat, load_pem_public_key
@@ -24,14 +26,38 @@ logger.setLevel(logging.INFO)
 
 SERVER_URL = 'http://127.0.0.1:8080'
 
-derived_key = None
-cipher = None
-mode = None
-digest = None
-parameters = None
-private_key = None
+DERIVED_KEY = None
+CIPHER = None
+MODE = None
+DIGEST = None
+PARAMETERS = None
+PRIVATE_KEY = None
+TOKEN = None
 
 def send(method, endpoint, message=None):
+    """
+    Function used to send a make a request to a specific endpoint of the api of the server via HTTP protocol, adding the authentication
+    token to the header if it exists
+
+    @param: method Request method
+    @param: endpoint Endopoint to which the request should be made
+    @param: message Body of the message, default is None
+    @return The request to the server's api
+    """
+
+    global TOKEN
+
+    if TOKEN:
+        header = {"Authorization": f"{TOKEN.strip()}"}
+        if message is None and method == 'GET':
+            return requests.get(url= f'{SERVER_URL}/{endpoint}', headers=header)  
+
+        if method == 'GET':
+            return requests.get(url= f'{SERVER_URL}/{endpoint}', params=message, headers=header)  
+        
+        if method == 'POST':
+            return requests.post(url= f'{SERVER_URL}/{endpoint}', data= message, headers=header)  
+
     if message is None and method == 'GET':
         return requests.get(url= f'{SERVER_URL}/{endpoint}')  
 
@@ -42,6 +68,13 @@ def send(method, endpoint, message=None):
         return requests.post(url= f'{SERVER_URL}/{endpoint}', data= message)  
 
 def receive(requests):
+    """
+    Function used to receive an encrypted message from the server
+
+    @param: request The request made to the server
+    @return The message received in response to the request
+    """
+
     message = requests.json()
 
     # if its a secure message we should authenticate it via the mac
@@ -60,29 +93,38 @@ def receive(requests):
         message = decrypt(data, iv)
         message = json.loads(message)
 
+    if message.get('type') == 'ERROR':
+        print(message)
+    
     return message
 
 
 def authenticate_mac(mac, message):
-    #mac = binascii.a2b_base64(mac)
+    """
+    Function used to verify if the mac is authentic based on the digest of a key 
+    by a algorithm chosen in the negotiation between the server and the client
 
-    global cipher
-    global digest
+    @param: mac MAC received in a message from the server
+    @param: message Message received
+    @return True if the MAC is authenticated, False otherwise
+    """
+
+    global CIPHER
 
     # Slice key based on algorithm
-    if cipher == "ChaCha20":
-        key = derived_key[:32]
-    elif cipher == "AES":
-        key = derived_key[:16]
-    elif cipher == "3DES":
-        key = derived_key[:8]
+    if CIPHER == "ChaCha20":
+        key = DERIVED_KEY[:32]
+    elif CIPHER == "AES":
+        key = DERIVED_KEY[:16]
+    elif CIPHER == "3DES":
+        key = DERIVED_KEY[:8]
 
     # select the hash algoritm defined in the negotiations
-    if digest == 'SHA-256':
+    if DIGEST == 'SHA-256':
         algorithm = hashes.SHA256()
-    elif digest == 'SHA-384':
+    elif DIGEST == 'SHA-384':
         algorithm = hashes.SHA384()
-    elif digest == 'SHA-512':
+    elif DIGEST == 'SHA-512':
         algorithm = hashes.SHA512()
 
     _digest = hmac.HMAC(key, algorithm, backend=default_backend())
@@ -95,34 +137,40 @@ def authenticate_mac(mac, message):
         return False
 
 def decrypt(cryptogram, iv):
+    """
+    Function used to decrypt a criptogram using an iv and the mode and cipher negotiated
+    between the client and the server. It also removes the necessary padding if the cipher 
+    is made by blocks
 
-    global mode
-    global cipher
+    @param: cryptogram Cryptogram received from the server, containing the encrypted message
+    @param: iv Initial Value used by the server to encrypt the message
+    @return The text decrypted from the cryptogram received using the iv
+    """
 
-    if mode == 'CBC':
-        mode = modes.CBC(iv)
-    elif mode == 'GCM':
-        mode = modes.GCM(iv)
-    elif mode == 'ECB':
-        mode = modes.ECB() 
+    if MODE == 'CBC':
+        _mode = modes.CBC(iv)
+    elif MODE == 'GCM':
+        _mode = modes.GCM(iv)
+    elif MODE == 'ECB':
+        _mode = modes.ECB() 
 
-    if cipher == "ChaCha20":
-        key = derived_key[:32]
+    if CIPHER == "ChaCha20":
+        key = DERIVED_KEY[:32]
         algorithm = algorithms.ChaCha20(key, iv)
         _cipher = Cipher(algorithm, mode=None, backend=default_backend())
-    elif cipher == "AES":
-        key = derived_key[:16]
+    elif CIPHER == "AES":
+        key = DERIVED_KEY[:16]
         algorithm = algorithms.AES(key)
-        _cipher = Cipher(algorithm, mode, backend=default_backend())
-    elif cipher == "3DES":
-        key = derived_key[:8]
+        _cipher = Cipher(algorithm, _mode, backend=default_backend())
+    elif CIPHER == "3DES":
+        key = DERIVED_KEY[:8]
         algorithm = algorithms.TripleDES(key)
-        _cipher = Cipher(algorithm, mode, backend=default_backend())
+        _cipher = Cipher(algorithm, _mode, backend=default_backend())
 
     decryptor = _cipher.decryptor()
     text = decryptor.update(cryptogram) + decryptor.finalize()
 
-    if cipher == 'ChaCha20':
+    if CIPHER == 'ChaCha20':
         return text
 
     unpadder = padding.PKCS7(algorithm.block_size).unpadder()
@@ -131,19 +179,22 @@ def decrypt(cryptogram, iv):
     return text
 
 def get_dh_keys():
+    """
+    Function that triggeres the Diffie-Hellman's key generation process that generates the p and g 
+    parameters, generates a private key and a shared secret, as well as deriving the latter in order 
+    to create ephemeral keys for each session.
+    This process is then repeated when the servers send a message with the type REGEN_KEY, to assure
+    key rotation and therefore a extra level of security.  
 
-    global derived_key
-    global cipher
-    global mode
-    global digest
-    global parameters
-    global private_key
+    """
 
-    print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA PARKOUR")
+    global DERIVED_KEY
+    global PARAMETERS
+    global PRIVATE_KEY
 
-    if not parameters:
-        parameters = dh.generate_parameters(generator=2, key_size=1024, backend=default_backend())  
-        parameter_numbers = parameters.parameter_numbers()
+    if not PARAMETERS:
+        PARAMETERS = dh.generate_parameters(generator=2, key_size=1024, backend=default_backend())  
+        parameter_numbers = PARAMETERS.parameter_numbers()
         message = {
             'type': 'DH_INIT',
             'p': parameter_numbers.p, 
@@ -152,12 +203,12 @@ def get_dh_keys():
         req = send('POST', 'api/key', message)
         response = receive(req)
 
-    if not private_key:
+    if not PRIVATE_KEY:
         # generate a secret key
-        private_key = parameters.generate_private_key()
+        PRIVATE_KEY = PARAMETERS.generate_private_key()
 
         # generate the public key based on the private one -> g^(private_key) mod p 
-        public_key = private_key.public_key()
+        public_key = PRIVATE_KEY.public_key()
         message = {
             'type': 'KEY_EXCHANGE',
             'public_key': public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode() 
@@ -165,19 +216,17 @@ def get_dh_keys():
         req = send('POST', 'api/key', message)
 
         server_public_key = load_pem_public_key(response.get('public_key').encode(), backend=default_backend())
-        shared_secret = private_key.exchange(server_public_key)
+        shared_secret = PRIVATE_KEY.exchange(server_public_key)
 
-        print(f'Got shared secret: {shared_secret}')
-
-        if digest == 'SHA-256':
+        if DIGEST == 'SHA-256':
             algorithm = hashes.SHA256()
-        elif digest == 'SHA-384':
+        elif DIGEST == 'SHA-384':
             algorithm = hashes.SHA384()
-        elif digest == 'SHA-512':
+        elif DIGEST == 'SHA-512':
             algorithm = hashes.SHA512()
 
         # Derive key
-        derived_key = HKDF(
+        DERIVED_KEY = HKDF(
             algorithm = algorithm,
             length = algorithm.digest_size,
             salt = None,
@@ -185,57 +234,94 @@ def get_dh_keys():
             backend = default_backend()
         ).derive(shared_secret)
 
-        print(f'Got derived_key: {derived_key} with length {len(derived_key)}')
+def login(username, password):
+    """
+    Function used to generate and send to the server the hash of the password as well as the username to receive
+    an authentication token that should be used in the header of the requests made to the server.
 
+    @param: username The client's username, that should be sent to the server
+    @param: password The client's password, that should be hashed and sent to the server
+    @return The authentication token generated by the server
+    """
+
+    if DIGEST == 'SHA-256':
+        algorithm = hashes.SHA256()
+    elif DIGEST == 'SHA-384':
+        algorithm = hashes.SHA384()
+    elif DIGEST == 'SHA-512':
+        algorithm = hashes.SHA512()
+
+    # Hash password
+    h = hashes.Hash(algorithm, backend=default_backend())
+    h.update(password.strip().encode('latin'))
+    hashed_password = h.finalize()
+
+    message = {
+        'type': 'AUTH',
+        'username': username,
+        'data': hashed_password
+    }
+    req = send('POST', 'api/auth', message)
+    response = receive(req)
+
+    return (response.get('data'))
+        
 def main():
 
-    global derived_key
-    global cipher
-    global mode
-    global digest
-    global parameters
-    global private_key
+    global CIPHER
+    global MODE
+    global DIGEST
+    global PARAMETERS
+    global PRIVATE_KEY
+    global TOKEN
+    global username, password
 
     print("|--------------------------------------|")
     print("|         SECURE MEDIA CLIENT          |")
     print("|--------------------------------------|\n")
 
-    # Get a list of media files
     print("Contacting Server")
 
-    # TODO: Secure the session
-    # req = requests.get(f'{SERVER_URL}/api/protocols')
-    # if req.status_code == 200:
-    #    prots = receive(req)
-
-    message = {
-        'type': 'NEGOTIATE',
-        'mode': ["CBC", "GCM", "ECB"], 
-        'cipher': ["ChaCha20", "AES", "3DES"], 
-        'digest': ["SHA-256", "SHA-384", "SHA-512"]
-    }
-    req = send('POST', 'api/protocols', message)
-    response = receive(req)
-    cipher = response.get('cipher')
-    mode = response.get('mode')
-    digest = response.get('digest')
+    # Secur the session
+    if not CIPHER or not MODE or not DIGEST:
+        message = {
+            'type': 'NEGOTIATE',
+            'mode': ["CBC", "GCM", "ECB"], 
+            'cipher': ["ChaCha20", "AES", "3DES"], 
+            'digest': ["SHA-256", "SHA-384", "SHA-512"]
+        }
+        req = send('POST', 'api/protocols', message)
+        response = receive(req)
+        CIPHER = response.get('cipher')
+        MODE = response.get('mode')
+        DIGEST = response.get('digest')
 
     get_dh_keys()
 
+    if not TOKEN:
+
+        # user inputs for login
+        while True:
+            username = input("Username: ")
+            if len(username.strip()) != 0:
+               break
+
+        while True:
+            password = getpass.getpass("Password: ")
+            if len(password.strip()) != 0:
+                break
+
+        # Generate session token
+        TOKEN = login(username, password)
 
 
-    ##############################################################################################
-
-
-
-
+    # Get a list of media files
     req = requests.get(f'{SERVER_URL}/api/list')
     req = send("GET", "api/list")
     if req.status_code == '200':
         print("Got Server List")
 
     media_list = receive(req).get('data')
-
 
     # Present a simple selection menu    
     idx = 0
@@ -270,18 +356,22 @@ def main():
 
     # Get data from server and send it to the ffplay stdin through a pipe
     for chunk in range(media_item['chunks'] + 1):
-        req = requests.get(f'{SERVER_URL}/api/download?id={media_item["id"]}&chunk={chunk}')
+        req = send('GET', f'api/download?id={media_item["id"]}&chunk={chunk}')
         chunk = receive(req)
        
-        # TODO: Process chunk
+        # Regen key, if necessaty
         if chunk.get('type') == 'REGEN_KEY':
-            parameters = None
-            private_key = None
+            PARAMETERS = None
+            PRIVATE_KEY = None
             get_dh_keys()
             last_chunk =  chunk['last_chunk']
-            req = requests.get(f'{SERVER_URL}/api/download?id={media_item["id"]}&chunk={last_chunk}')
+
+            TOKEN = login(username, password)
+
+            req = send('GET', f'api/download?id={media_item["id"]}&chunk={last_chunk}')
             chunk = receive(req)
 
+        # Process chunk
         data = binascii.a2b_base64(chunk['data'].encode('latin'))
         try:
             proc.stdin.write(data)

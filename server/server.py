@@ -7,14 +7,16 @@ import binascii
 import base64
 import json
 import os
+import uuid
 import math
 import datetime
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.serialization import Encoding, ParameterFormat, PublicFormat, load_pem_public_key
+from cryptography.hazmat.primitives.serialization import Encoding, ParameterFormat, PublicFormat, load_pem_public_key, load_pem_private_key
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 
@@ -33,26 +35,67 @@ CATALOG = { '898a08080d1840793122b7e118b27a95d117ebce':
                 'file_size': 3407202
             }
         }
-
+USERS = { 'miri': 
+            {
+                'name': 'Mariana Ladeiro',
+                'email': 'marianaladeiro@ua.pt',
+                'password': b'\xd4\x04U\x9f`.\xabo\xd6\x02\xacv\x80\xda\xcb\xfa\xad\xd1603^\x95\x1f\tz\xf3\x90\x0e\x9d\xe1v\xb6\xdb(Q/.\x00\x0b\x9d\x04\xfb\xa5\x13>\x8b\x1cn\x8d\xf5\x9d\xb3\xa8\xab\x9d`\xbeK\x97\xcc\x9e\x81\xdb'
+            }
+        }
 CATALOG_BASE = 'catalog'
 LICENSE_BASE = 'licenses'
 CHUNK_SIZE = 1024 * 4
 KEY_ROTATION_NR = 20
 
-class MediaServer(resource.Resource):
-    isLeaf = True
-    derived_key = None
-    cipher = None
-    count = 0
+class MediaServer(resource.Resource):   
+
+    def __init__(self):
+        self.isLeaf = True
+        self.derived_key = None
+        self.cipher = None
+        self.mode = None
+        self.digest = None
+        self.count = 0
+
+        # server certficate
+        with open('certificates/media_cert.pem','rb') as f:
+            crt_data = f.read()
+
+        self.certificate = x509.load_pem_x509_certificate(crt_data, default_backend())
+
+        # server CA private and public key 
+        with open("certificates/media_key.pem", "rb") as key_file:
+            self.ca_private_key = load_pem_private_key(
+                key_file.read(),
+                password=None,
+            )
+        self.ca_public_key = self.ca_private_key.public_key()
 
     # Send the list of media files to clients
     def do_list(self, request):
 
-        #auth = request.getHeader('Authorization')
-        #if not auth:
-        #    request.setResponseCode(401)
-        #    return 'Not authorized'
+        token = request.getHeader(b'Authorization')
+        logger.debug(f'Received token: {token}')
 
+        if token is None:
+
+            request.setResponseCode(401)
+            message = {
+                'type': 'ERROR',
+                'error': 'Not authorized' 
+            }
+            return self.send(message)
+
+
+        auth = self.authenticate_token(token)
+        if not auth:
+
+            request.setResponseCode(401)
+            message = {
+                'type': 'ERROR',
+                'error': 'Not authorized!' 
+            }
+            return self.send(message)
 
         # Build list
         media_list = []
@@ -287,7 +330,7 @@ class MediaServer(resource.Resource):
         key generation process that generates the p and g parameters, generates a private key 
         and a shared secret, as well as deriving the latter in order to create ephemeral keys
         for each session.
-        This process is then repeated when the number received messages from the client surpasses 20,
+        This process is then repeated when the number of received messages from the client surpasses 20,
         to assure key rotation and therefore a extra level of security.  
 
         @param: request Request that come from the client in bytes
@@ -361,9 +404,6 @@ class MediaServer(resource.Resource):
         @return The encrypted response sent to the client    
         """
 
-        self.parameters = None
-        self.private_key = None
-        self.derived_key = None
         last_chunk = request.args.get(b'chunk', [b'0'])[0].decode()
         message = {
             'type': 'REGEN_KEY',
@@ -371,7 +411,103 @@ class MediaServer(resource.Resource):
         }
         return self.send(message)
 
-    def check_license(self, media_id):
+    def authenticate_token(self, token):
+        """
+        Method called to authenticate the token received when the client does a request to 
+        the server. It uses the digest of an unique id and then verifies if the token is
+        authentic by comparing it with the signature
+
+        @param: token Token receiven in the header of the request
+        @return True if the token if the token is authenticated, False otherwise.
+        """
+        token = binascii.a2b_base64(token)
+
+        # Slice key based on algorithm
+        if self.cipher == "ChaCha20":
+            key = self.derived_key[:32]
+        elif self.cipher == "AES":
+            key = self.derived_key[:16]
+        elif self.cipher == "3DES":
+            key = self.derived_key[:8]
+
+        # select the hash algoritm defined in the negotiations
+        if self.digest == 'SHA-256':
+            algorithm = hashes.SHA256()
+        elif self.digest == 'SHA-384':
+            algorithm = hashes.SHA384()
+        elif self.digest == 'SHA-512':
+            algorithm = hashes.SHA512()
+
+        digest = hmac.HMAC(key, algorithm, backend=default_backend())
+        digest.update(self.uuid.encode('latin'))
+        
+        try:
+            digest.verify(token)
+            return True
+        except:
+            return False
+
+    def do_authentication(self, request):
+        """
+        Method used to create a token based on the login request made by the user. First compares
+        the received hash with the one stored in the simulated database (USERS) and if its the same
+        creates a token for authentication and send it to the client.
+
+        @param: request The request that is received from the client
+        @return The response sent to the client 
+        """
+
+        data = request.args.get(b'data')[0]
+        username = request.args.get(b'username')[0].decode()
+        logger.debug(f'Received data: {data}')
+
+        if USERS.get(username):
+
+            if USERS.get(username).get('password') == data:
+                
+                # generating token
+                if self.cipher == "ChaCha20":
+                    key = self.derived_key[:32]
+                elif self.cipher == "AES":
+                    key = self.derived_key[:16]
+                elif self.cipher == "3DES":
+                    key = self.derived_key[:8]
+
+                # select the hash algoritm defined in the negotiations
+                if self.digest == 'SHA-256':
+                    hash_algorithm = hashes.SHA256()
+                elif self.digest == 'SHA-384':
+                    hash_algorithm = hashes.SHA384()
+                elif self.digest == 'SHA-512':
+                    hash_algorithm = hashes.SHA512()
+
+                digest = hmac.HMAC(key=key, algorithm=hash_algorithm, backend=default_backend())
+                self.uuid = uuid.uuid4().hex
+                digest.update(self.uuid.encode('latin'))
+                token = digest.finalize()
+
+                message = {
+                    'type': 'SUCESS_AUTH',
+                    'data': binascii.b2a_base64(token).decode()
+                }
+                return self.send(message)
+
+            else:
+                logger.debug('Authentication failed - wrong password')
+                message = {
+                    'type': 'ERROR',
+                    'error': 'Authentication failed'
+                }
+                return self.send(message)
+        else:
+            logger.debug('Authentication failed - no such user')
+            message = {
+                    'type': 'ERROR',
+                    'error': 'Authentication failed'
+            }
+            return self.send(message)
+
+    def check_license(self, media_id, chunk_id):
         """
         Check if a client has a viewing license for a speciffic media by reading the respective
         media's file license and checking if the client is listed and if the licence is valid.
@@ -383,34 +519,39 @@ class MediaServer(resource.Resource):
         """
 
         with open(os.path.join(LICENSE_BASE, media_id), 'rb+') as f:
-            # f.write(binascii.b2a_base64("0001\t1978-10-2 12:12:12.000\t10\n".encode('latin')))
-            # f.write(binascii.b2a_base64("0001\t2020-12-30 12:00:00.000\t10000\n".encode('latin')))
-            # f.seek(0)
+            f.write(binascii.b2a_base64("miri\t2021-12-30 12:00:00.000\t10000\t200\n".encode('latin')))
+            f.seek(0)
 
             valid = None
             d = f.readlines()
             f.seek(0)
 
             for line in d:
-                line = binascii.a2b_base64(line)
-                client_id = b'0001'
-                _line = line.strip().split(b'\t')
+                line = binascii.a2b_base64(line).decode()
+                client_id = 'miri'
+                _line = line.strip().split('\t')
 
                 if client_id == _line[0]:
-                    if datetime.datetime.strptime(_line[1].decode(), '%Y-%m-%d %H:%M:%S.%f') + datetime.timedelta(seconds= int(_line[2].decode())) < datetime.datetime.now():
-                        if valid != True:
-                            logger.debug('This viewing license expired')
-                            valid = False
+                    if datetime.datetime.strptime(_line[1], '%Y-%m-%d %H:%M:%S.%f') + datetime.timedelta(seconds= int(_line[2])) < datetime.datetime.now() and valid != True:
+                        # The licence date expired
+                        valid = False
+
+                    elif chunk_id == b'1' and int(_line[3]) <= 0 and valid != True:
+                        # The number of views expired
+                        valid = False
+
                     else:
-                        # There is a valid and not expired license in the client's name
-                        f.write(binascii.b2a_base64(line))
+                        # There is a valid license in the client's name
+                        new_line = f'{_line[0]}\n{_line[1]}\n{_line[2]}\n{int(_line[3])- 1}'.encode('latin')
+                        f.write(binascii.b2a_base64(new_line))
                         valid = True
                 
                 else:
-                    f.write(binascii.b2a_base64(line))
-                    if valid != True:
-                        logger.debug('Client has no rights to view this content')
-                        valid = False
+                    f.write(binascii.b2a_base64(line.encode('latin')))
+                    
+            if valid is None:
+                logger.debug('Client has no rights to view this content')
+                valid = False
 
             f.truncate()
             f.close()
@@ -423,6 +564,26 @@ class MediaServer(resource.Resource):
         
         media_id = request.args.get(b'id', [None])[0]
         logger.debug(f'Download: id: {media_id}')
+
+        # Check if token is in the header
+        token = request.getHeader(b'Authorization')
+        if token is None:
+            request.setResponseCode(401)
+            message = {
+                'type': 'ERROR',
+                'error': 'Not authorized' 
+            }
+            return self.send(message)
+
+        # Check if token is valid
+        auth = self.authenticate_token(token)
+        if not auth:
+            request.setResponseCode(401)
+            message = {
+                'type': 'ERROR',
+                'error': 'Not authorized' 
+            }
+            return self.send(message)
 
         # Check if the media_id is not None as it is required
         if media_id is None:
@@ -442,12 +603,6 @@ class MediaServer(resource.Resource):
         # Get the media item
         media_item = CATALOG[media_id]
 
-        # Check licenciong
-        if not self.check_license(media_id):
-            request.setResponseCode(403)
-            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-            return json.dumps({'error': 'No access rights to the content'}).encode('latin')
-
         # Check if a chunk is valid
         chunk_id = request.args.get(b'chunk', [b'0'])[0]
         valid_chunk = False
@@ -466,6 +621,12 @@ class MediaServer(resource.Resource):
         logger.debug(f'Download: chunk: {chunk_id}')
 
         offset = chunk_id * CHUNK_SIZE
+
+        # Check licenciong
+        if not self.check_license(media_id, chunk_id):
+            request.setResponseCode(403)
+            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
+            return json.dumps({'error': 'No access rights to the content'}).encode('latin')
 
         # Open file, seek to correct position and return the chunk
         with open(os.path.join(CATALOG_BASE, media_item['file_name']), 'rb') as f:
@@ -488,21 +649,21 @@ class MediaServer(resource.Resource):
     def render_GET(self, request):
         logger.debug(f'Received request for {request.uri}')
         
-        if self.count == KEY_ROTATION_NR:
-            self.count = 0
-            logger.debug("Regening keys for key rotation..")
-            return self.do_regen_key(request)
-
-
         try:
             if request.path == b'/api/protocols':
                 return self.do_get_protocols(request)
-            #elif request.uri == 'api/auth':
 
             elif request.path == b'/api/list':
                 return self.do_list(request)
 
             elif request.path == b'/api/download':
+
+                # Chunk based key rotation
+                if self.count == KEY_ROTATION_NR:
+                    self.count = 0
+                    logger.debug("Regenning keys for key rotation..")
+                    return self.do_regen_key(request)
+                
                 return self.do_download(request)
             else:
                 request.responseHeaders.addRawHeader(b"content-type", b'text/plain')
@@ -521,6 +682,9 @@ class MediaServer(resource.Resource):
             return self.do_post_protocols(request)
         elif request.uri == b'/api/key':
             return self.do_dh_exchange(request)
+        elif request.uri == b'/api/auth':
+            return self.do_authentication(request)
+
         request.setResponseCode(501)
         return b''
 

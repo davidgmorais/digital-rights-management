@@ -52,5 +52,5 @@ tent authenticity
 4. Integrate hardware tokens to authenticate users
 5. Protect the media content at rest in the server
 
-### Report
+## Report
 The report describes the protocols in detail (entities, messages, keys, processes, flows), the mechanisms, and demonstrate the correct operation of the features implemented.
